@@ -10,14 +10,15 @@
 #define BAUDRATE  1000000
 #define DXL_ID_3  3    // Upper 
 #define DXL_ID_2  2    // Lower 
+#define DXL_ID_6  6    //  Lower
 #define DXL_ID_7  7    // Upper 
-#define DXL_ID_6  6    // Lower 
 
 DynamixelWorkbench dxl_wb;
 
-uint8_t dxl_id[4] = {DXL_ID_3, DXL_ID_2, DXL_ID_7, DXL_ID_6};
+uint8_t dxl_id[4] = {DXL_ID_3, DXL_ID_2, DXL_ID_7 , DXL_ID_6};
 const uint8_t handler_index = 0;
 const float LENGTH = 210.0; // leg length
+// 在所有函數實現之前添加函數原型
 
 struct IKAngles {
     float theta_hp;
@@ -35,13 +36,11 @@ Position currentPos = {0, 0, 0};
 Position targetPos = {0, 0, 0};
 bool isRelativeMove = true;
 
-// 步行參數結構體
+// 簡化步行參數結構體
 struct WalkingParams {
     float step_length;      // 步長
-    float step_height;      // 抬腳高度
     float squat_height;     // 下蹲高度
     float cycle_time;       // 一個步態週期的時間
-    bool is_left_support;   // 是否左腳支撐
 };
 
 // 貝塞爾曲線控制點結構體
@@ -53,12 +52,26 @@ struct BezierPoint {
 
 // 全局步行參數
 WalkingParams walkParams = {
-    .step_length = 30.0,    // 默認步長30mm
-    .step_height = 30.0,    // 默認抬腳高度30mm
-    .squat_height = 20.0,   // 默認下蹲高度20mm
-    .cycle_time = 1.0,      // 一個步態週期1秒
-    .is_left_support = true // 默認從左腳支撐開始
+    .step_length = 20.0,    // 默認步長20mm
+    .squat_height = 5.0,    // 下蹲高度5mm
+    .cycle_time = 2.0       // 一個步態週期2秒
 };
+
+// 添加全局变量来存储每条腿的初始位置
+int32_t leftLegInitialPos[2] = {2048, 2048};  // 左腿的初始位置
+int32_t rightLegInitialPos[2] = {2048, 2048}; // 右腿的初始位置
+
+// 添加新的全局變量來跟踪實際下蹲高度
+float currentSquatHeight = 20.0;  // 初始微蹲高度
+
+// 計算所需的下蹲高度
+float calculateRequiredSquatHeight(float stepLength) {
+    float squatIncrement = stepLength * 0.5;  // 每10mm步長增加5mm下蹲
+    if (squatIncrement > 20.0) {  // 如果計算出的增量大於初始下蹲高度
+        return squatIncrement;  // 則使用計算值作為新的下蹲高度
+    }
+    return 20.0;  // 否則保持20mm的初始下蹲高度
+}
 
 // 計算逆运动学
 IKAngles calculateInverseKinematics(float x, float y, float z) {
@@ -83,6 +96,42 @@ int32_t convertRadianToPosition(float radian) {
     return (int32_t)((4096.0/360.0) * degree);
 }
 
+// 移动到指定坐标
+bool moveToCoordinate(float x, float y, float z, bool isLeftLeg = true) {
+    targetPos.x = isRelativeMove ? currentPos.x + x : x;
+    targetPos.y = isRelativeMove ? currentPos.y + y : y;
+    targetPos.z = isRelativeMove ? currentPos.z + z : z;
+    
+    IKAngles legAngles;
+    
+    if(isLeftLeg) {
+        legAngles = calculateInverseKinematics(targetPos.x, targetPos.y, targetPos.z);
+    } else {
+        legAngles = calculateInverseKinematics(targetPos.x, -targetPos.y, targetPos.z);
+    }
+    
+    int32_t targetPositions[4];
+    if(isLeftLeg) {
+        targetPositions[0] = convertRadianToPosition(-(legAngles.theta_hp+M_PI));
+        targetPositions[1] = convertRadianToPosition(legAngles.theta_ap-M_PI);
+        targetPositions[2] = rightLegInitialPos[0];
+        targetPositions[3] = rightLegInitialPos[1];
+    } else {
+        targetPositions[0] = leftLegInitialPos[0];
+        targetPositions[1] = leftLegInitialPos[1];
+        targetPositions[2] = convertRadianToPosition(-(legAngles.theta_hp+M_PI));
+        targetPositions[3] = convertRadianToPosition(legAngles.theta_ap-M_PI);
+    }
+    
+    bool result = moveWithAdaptiveSpeed(targetPositions);
+    
+    if (result) {
+        currentPos = targetPos;
+    }
+    
+    return result;
+}
+
 // 初始化位置
 bool initializePosition() {
     const char *log;
@@ -90,6 +139,19 @@ bool initializePosition() {
     
     bool result = dxl_wb.syncWrite(handler_index, middlePositions, &log);
     if (result) {
+        leftLegInitialPos[0] = middlePositions[0];
+        leftLegInitialPos[1] = middlePositions[1];
+        rightLegInitialPos[0] = middlePositions[2];
+        rightLegInitialPos[1] = middlePositions[3];
+        delay(1000);
+        
+        isRelativeMove = false;
+        if(!moveToCoordinate(0, 0, 20.0, true) || 
+           !moveToCoordinate(0, 0, 20.0, false)) {
+            Serial.println("Failed to enter initial squat position!");
+            return false;
+        }
+        currentSquatHeight = 20.0;
         delay(1000);
     } else {
         Serial.println("Failed to set initial position");
@@ -124,21 +186,6 @@ bool initializeDynamixels() {
     }
 
     return dxl_wb.addSyncWriteHandler(dxl_id[0], "Goal_Position", &log);
-}
-
-// 移动到初始位置
-bool moveToInitialPosition() {
-    if (!initializePosition()) {
-        return false;
-    }
-    
-    isRelativeMove = false;
-    if (!moveToCoordinate(0, 0, 20)) {
-        Serial.println("Initial micro squat movement failed!");
-        return false;
-    }
-    
-    return true;
 }
 
 // 读取所有电机位置
@@ -210,33 +257,8 @@ bool moveWithAdaptiveSpeed(int32_t targetPositions[4]) {
 
         delay(5);
     }
-    
-    return dxl_wb.syncWrite(handler_index, targetPositions, &log);
-}
 
-// 移动到指定坐标
-bool moveToCoordinate(float x, float y, float z) {
-    targetPos.x = isRelativeMove ? currentPos.x + x : x;
-    targetPos.y = isRelativeMove ? currentPos.y + y : y;
-    targetPos.z = isRelativeMove ? currentPos.z + z : z;
-    
-    IKAngles leftLegAngles = calculateInverseKinematics(targetPos.x, targetPos.y, targetPos.z);
-    IKAngles rightLegAngles = calculateInverseKinematics(targetPos.x, -targetPos.y, targetPos.z);
-    
-    int32_t targetPositions[4] = {
-        convertRadianToPosition(-(leftLegAngles.theta_hp+M_PI)),
-        convertRadianToPosition(leftLegAngles.theta_ap-M_PI),
-        convertRadianToPosition(-(rightLegAngles.theta_hp+M_PI)),
-        convertRadianToPosition(rightLegAngles.theta_ap-M_PI)
-    };
-    
-    bool result = moveWithAdaptiveSpeed(targetPositions);
-    
-    if (result) {
-        currentPos = targetPos;
-    }
-    
-    return result;
+    return dxl_wb.syncWrite(handler_index, targetPositions, &log);
 }
 
 // 計算貝塞爾曲線點
@@ -257,75 +279,104 @@ Position calculateBezierPoint(BezierPoint p0, BezierPoint p1, BezierPoint p2, Be
 
 // 執行一個步態週期
 bool executeWalkingCycle() {
-    const int STEPS = 50;  // 一個週期的採樣點數
-    float dt = walkParams.cycle_time / STEPS;
+    float currentX = 0.0f;
     
-    // 設置支撐腳和擺動腳的起始位置（使用浮點數）
-    Position supportLeg = {0.0f, walkParams.is_left_support ? 5.0f : -5.0f, walkParams.squat_height};
-    Position swingLeg = {0.0f, walkParams.is_left_support ? -5.0f : 5.0f, walkParams.squat_height};
-    
-    // 定義擺動腳的貝塞爾曲線控制點
-    BezierPoint p0 = {swingLeg.x, swingLeg.y, swingLeg.z};  // 起始點
-    BezierPoint p1 = {swingLeg.x + walkParams.step_length/3.0f, swingLeg.y, swingLeg.z + walkParams.step_height}; // 第一控制點
-    BezierPoint p2 = {swingLeg.x + 2.0f*walkParams.step_length/3.0f, swingLeg.y, swingLeg.z + walkParams.step_height}; // 第二控制點
-    BezierPoint p3 = {swingLeg.x + walkParams.step_length, swingLeg.y, swingLeg.z}; // 終點
-    
-    // 執行擺動腳的運動
-    for(int i = 0; i < STEPS; i++) {
-        float t = (float)i / (STEPS - 1);
-        Position swingPos = calculateBezierPoint(p0, p1, p2, p3, t);
-        
-        // 移動雙腿
-        if(walkParams.is_left_support) {
-            if(!moveToCoordinate(supportLeg.x, supportLeg.y, supportLeg.z)) return false;
-            if(!moveToCoordinate(swingPos.x, swingPos.y, swingPos.z)) return false;
-        } else {
-            if(!moveToCoordinate(swingPos.x, swingPos.y, swingPos.z)) return false;
-            if(!moveToCoordinate(supportLeg.x, supportLeg.y, supportLeg.z)) return false;
+    float requiredSquatHeight = calculateRequiredSquatHeight(walkParams.step_length);
+    if (requiredSquatHeight > currentSquatHeight) {
+        isRelativeMove = false;
+        if(!moveToCoordinate(0, 0, requiredSquatHeight, true) || 
+           !moveToCoordinate(0, 0, requiredSquatHeight, false)) {
+            Serial.println("Failed to adjust squat height!");
+            return false;
         }
-        
-        delay(dt * 1000);  // 轉換為毫秒
-        
-        // 檢查是否收到停止命令
-        if(Serial.available() > 0) {
-            char cmd = Serial.read();
-            if(cmd == 'q' || cmd == 'Q') return false;
-        }
+        currentSquatHeight = requiredSquatHeight;
+        delay(500);
     }
     
-    // 切換支撐腳
-    walkParams.is_left_support = !walkParams.is_left_support;
+    // 計算抬腳高度（步長的一半）
+    float stepHeight = walkParams.step_length * 0.5;
+    
+    // 左腿動作序列
+    if(!moveToCoordinate(0, 0, currentSquatHeight + stepHeight, true)) {
+        Serial.println("Failed to lift left leg!");
+        return false;
+    }
+    delay(300);
+    
+    if(!moveToCoordinate(walkParams.step_length, 0, currentSquatHeight + stepHeight, true)) {
+        Serial.println("Failed to extend left leg!");
+        return false;
+    }
+    delay(300);
+    
+    if(!moveToCoordinate(walkParams.step_length, 0, currentSquatHeight, true)) {
+        Serial.println("Failed to lower left leg!");
+        return false;
+    }
+    delay(500);
+    
+    // 右腿動作序列
+    if(!moveToCoordinate(walkParams.step_length, 0, currentSquatHeight + stepHeight, false)) {
+        Serial.println("Failed to lift right leg!");
+        return false;
+    }
+    delay(300);
+    
+    if(!moveToCoordinate(walkParams.step_length * 2, 0, currentSquatHeight + stepHeight, false)) {
+        Serial.println("Failed to extend right leg!");
+        return false;
+    }
+    delay(300);
+    
+    if(!moveToCoordinate(walkParams.step_length * 2, 0, currentSquatHeight, false)) {
+        Serial.println("Failed to lower right leg!");
+        return false;
+    }
+    delay(500);
+    
+    currentX = walkParams.step_length * 2;
+    
+    if(Serial.available() > 0) {
+        char cmd = Serial.read();
+        if(cmd == 'q' || cmd == 'Q') return false;
+    }
+    
     return true;
 }
 
 // 執行連續步行
 bool startWalking(float step_length) {
-    // 更新步長
     walkParams.step_length = step_length;
     
-    // 先進入初始下蹲姿態
-    isRelativeMove = false;
-    if(!moveToCoordinate(0, 0, walkParams.squat_height)) {
-        Serial.println("Failed to enter initial squat position!");
-        return false;
+    float requiredSquatHeight = calculateRequiredSquatHeight(step_length);
+    
+    if (requiredSquatHeight > currentSquatHeight) {
+        isRelativeMove = false;
+        if(!moveToCoordinate(0, 0, requiredSquatHeight, true) || 
+           !moveToCoordinate(0, 0, requiredSquatHeight, false)) {
+            Serial.println("Failed to adjust squat height!");
+            return false;
+        }
+        currentSquatHeight = requiredSquatHeight;
+        delay(500);
     }
     
     Serial.println("Starting to walk...");
     Serial.println("Press 'q' to stop");
     
-    // 開始連續步行
     while(true) {
         if(!executeWalkingCycle()) {
             break;
         }
     }
     
-    // 返回安全姿態
     isRelativeMove = false;
-    if(!moveToCoordinate(0, 0, walkParams.squat_height)) {
-        Serial.println("Failed to return to safe position!");
+    if(!moveToCoordinate(0, 0, 20.0, true) || 
+       !moveToCoordinate(0, 0, 20.0, false)) {
+        Serial.println("Failed to return to initial squat position!");
         return false;
     }
+    currentSquatHeight = 20.0;
     
     return true;
 }
@@ -340,8 +391,8 @@ void setup() {
         Serial.println("Motor initialization failed!");
         while(1);
     }
-
-    if (!moveToInitialPosition()) {
+    
+    if (!initializePosition()) {
         Serial.println("Initial position setting failed!");
         while(1);
     }
@@ -387,4 +438,4 @@ void loop() {
     }
     delay(10);
 }
-//Att// 
+//tt1// 
